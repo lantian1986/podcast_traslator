@@ -62,6 +62,32 @@ class GlmApiError(RuntimeError):
         super().__init__(f"API error {status}: {self.body}")
 
 
+def friendly_error(exc: Exception) -> str:
+    if isinstance(exc, GlmApiError):
+        if exc.code == "1301":
+            return "GLM blocked the content for safety. Try a different episode or a shorter part length."
+        return f"GLM API failed with HTTP {exc.status}. Check GLM_API_KEY, model names, and account quota."
+    if isinstance(exc, subprocess.CalledProcessError):
+        detail = exc.stderr.decode("utf-8", "replace").strip() if exc.stderr else ""
+        first_line = detail.splitlines()[-1] if detail else "no ffmpeg details"
+        return f"ffmpeg failed while processing audio: {first_line}"
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"Remote server returned HTTP {exc.code}. Check the RSS or audio URL."
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", exc)
+        return f"Could not reach the RSS or audio URL: {reason}"
+    if isinstance(exc, ET.ParseError):
+        return "The URL did not return valid RSS XML."
+    message = str(exc)
+    if message == "GLM_API_KEY is not set":
+        return "GLM_API_KEY is not set. Add it to .env or export it before starting the server."
+    if message == "RSS channel not found":
+        return "The feed loaded, but it does not look like a podcast RSS feed."
+    if message == "All parts were blocked by GLM content filtering.":
+        return message
+    return message or exc.__class__.__name__
+
+
 def ensure_dirs() -> None:
     JOBS.mkdir(parents=True, exist_ok=True)
 
@@ -475,7 +501,7 @@ def run_job(
 
         set_job(job_id, status="done", progress=100, output=f"/files/{job_id}/{output.name}")
     except Exception as exc:
-        set_job(job_id, status="failed", error=str(exc), progress=0)
+        set_job(job_id, status="failed", error=friendly_error(exc), progress=0)
 
 
 def run_demo_job(job_id: str, target_lang: str) -> None:
@@ -504,7 +530,7 @@ def run_demo_job(job_id: str, target_lang: str) -> None:
             translation=translated,
         )
     except Exception as exc:
-        set_job(job_id, status="failed", error=str(exc), progress=0)
+        set_job(job_id, status="failed", error=friendly_error(exc), progress=0)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -573,7 +599,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
         except Exception as exc:
-            self.html(page("Error", f"<p class='error'>{html.escape(str(exc))}</p><p><a href='/'>Back</a></p>"), 500)
+            message = html.escape(friendly_error(exc))
+            self.html(page("Error", f"<p class='error'>{message}</p><p><a href='/'>Back</a></p>"), 500)
 
     def form(self) -> dict[str, str]:
         ctype, pdict = cgi.parse_header(self.headers.get("content-type", ""))
