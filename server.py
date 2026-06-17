@@ -489,6 +489,29 @@ def set_job(job_id: str, **changes) -> None:
         )
 
 
+def load_job(job_id: str) -> dict:
+    with LOCK:
+        if job_id in STATE:
+            return STATE[job_id]
+    job_file = JOBS / job_id / "job.json"
+    if not job_file.exists():
+        return {"status": "missing"}
+    data = json.loads(job_file.read_text(encoding="utf-8"))
+    with LOCK:
+        STATE[job_id] = data
+    return data
+
+
+def recent_jobs(limit: int = 8) -> list[dict]:
+    jobs = []
+    for job_file in JOBS.glob("*/job.json"):
+        data = json.loads(job_file.read_text(encoding="utf-8"))
+        data.setdefault("id", job_file.parent.name)
+        jobs.append(data)
+    jobs.sort(key=lambda job: job.get("created_at", 0), reverse=True)
+    return jobs[:limit]
+
+
 def run_job(
     job_id: str, title: str, audio_url: str, target_lang: str, listen_part_seconds: str, output_mode: str
 ) -> None:
@@ -609,6 +632,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
             self.html(home())
+        elif parsed.path.startswith("/job/"):
+            self.html(job_page(parsed.path.rsplit("/", 1)[-1]))
         elif parsed.path.startswith("/jobs/"):
             self.json(job_status(parsed.path.rsplit("/", 1)[-1]))
         elif parsed.path.startswith("/files/"):
@@ -733,8 +758,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def job_status(job_id: str) -> dict:
-    with LOCK:
-        return STATE.get(job_id, {"status": "missing"})
+    return load_job(job_id)
 
 
 def page(title: str, body: str) -> str:
@@ -776,8 +800,29 @@ def home() -> str:
   <p><button>Run sample MP3</button></p>
   <p class="muted">30-second local English MP3 sample</p>
 </form>
+{recent_jobs_html()}
 <p class="muted">Tiny MVP: standard-library Python app, GLM API for ASR/translation/TTS.</p>""",
     )
+
+
+def recent_jobs_html() -> str:
+    jobs = recent_jobs()
+    if not jobs:
+        return ""
+    items = []
+    for job in jobs:
+        job_id = html.escape(job.get("id", ""))
+        title = html.escape(job.get("title") or job_id)
+        status = html.escape(job.get("status", ""))
+        created_at = int(job.get("created_at", 0))
+        created = html.escape(time.strftime("%Y-%m-%d %H:%M", time.localtime(created_at)))
+        items.append(
+            f"""<li>
+<a href="/job/{job_id}">{title}</a>
+<span class="muted">{status} · {created}</span>
+</li>"""
+        )
+    return f"<h2>Recent jobs</h2><ol>{''.join(items)}</ol>"
 
 
 def output_mode_select() -> str:
