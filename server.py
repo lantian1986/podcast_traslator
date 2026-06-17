@@ -38,16 +38,10 @@ USER_AGENT = "podcast-translator-mvp/0.1"
 
 STATE: dict[str, dict] = {}
 LOCK = threading.Lock()
-DEMO_TRANSCRIPT = """Welcome to the Tiny Podcast Lab.
-
-In this short sample, we test the core workflow of a podcast translator.
-The server takes transcript text, translates it into Chinese, turns the
-translation into speech, and gives you a downloadable audio file.
-
-The real podcast path adds RSS parsing, episode download, and speech
-recognition before these same translation and voice steps."""
 SAMPLE_RSS_URL = "https://feeds.npr.org/510325/podcast.xml"
 SAMPLE_RSS_TITLE = "The Indicator from Planet Money"
+SAMPLE_MP3 = ROOT / "assets" / "sample-english-30s.mp3"
+SAMPLE_MP3_TITLE = "Sample English 30s"
 
 
 class GlmApiError(RuntimeError):
@@ -118,6 +112,61 @@ def normalize_seconds(value: str, default: int = 300) -> str:
         seconds = default
     seconds = min(max(seconds, 60), 900)
     return str(seconds)
+
+
+def normalize_output_mode(value: str) -> str:
+    return value if value in {"english", "chinese", "bilingual"} else "chinese"
+
+
+def paragraphs(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+
+
+def transcript_sentences(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return []
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", normalized) if part.strip()]
+
+
+def normalize_transcript_paragraphs(text: str) -> str:
+    sentences = transcript_sentences(text)
+    if not sentences:
+        return text.strip()
+    parts = []
+    current = []
+    current_len = 0
+    for sentence in sentences:
+        next_len = current_len + len(sentence)
+        should_break = len(current) >= 2 and (len(current) >= 4 or next_len > 600)
+        if should_break:
+            parts.append(" ".join(current))
+            current = []
+            current_len = 0
+        current.append(sentence)
+        current_len += len(sentence) + 1
+    if current:
+        parts.append(" ".join(current))
+    return "\n\n".join(parts)
+
+
+def bilingual_text(transcript: str, translation: str) -> str:
+    source_parts = paragraphs(transcript)
+    translated_parts = paragraphs(translation)
+    if source_parts and len(source_parts) == len(translated_parts):
+        parts = []
+        for source, translated in zip(source_parts, translated_parts):
+            parts.append(f"{source}\n\n{translated}")
+        return "\n\n".join(parts)
+    return f"{transcript.strip()}\n\n{translation.strip()}".strip()
+
+
+def build_output_text(transcript: str, translation: str, output_mode: str) -> str:
+    if output_mode == "english":
+        return transcript
+    if output_mode == "bilingual":
+        return bilingual_text(transcript, translation)
+    return translation
 
 
 def fetch_bytes(url: str, timeout: int = 60) -> tuple[bytes, str]:
@@ -275,6 +324,14 @@ def synthesize(text: str, out_path: Path) -> None:
     concat_audio(chunks, out_path)
 
 
+def synthesize_with_original_audio(original_audio: Path, translation: str, out_path: Path) -> None:
+    original_wav = out_path.with_name(f"{out_path.stem}_original.wav")
+    translation_wav = out_path.with_name(f"{out_path.stem}_translation.wav")
+    normalize_audio(original_audio, original_wav)
+    synthesize(translation, translation_wav)
+    concat_audio([original_wav, translation_wav], out_path)
+
+
 def synthesize_chunk(text: str, out_path: Path) -> None:
     payload = {
         "model": os.environ.get("GLM_TTS_MODEL", "glm-tts"),
@@ -290,6 +347,28 @@ def synthesize_chunk(text: str, out_path: Path) -> None:
         {"Content-Type": "application/json"},
     )
     out_path.write_bytes(raw)
+
+
+def normalize_audio(audio_path: Path, out_path: Path) -> None:
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg is required to normalize original audio")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(audio_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "24000",
+            str(out_path),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
 
 
 def split_audio(audio_path: Path) -> list[Path]:
@@ -411,14 +490,16 @@ def set_job(job_id: str, **changes) -> None:
 
 
 def run_job(
-    job_id: str, title: str, audio_url: str, target_lang: str, listen_part_seconds: str
+    job_id: str, title: str, audio_url: str, target_lang: str, listen_part_seconds: str, output_mode: str
 ) -> None:
     job_dir = JOBS / job_id
     try:
+        output_mode = normalize_output_mode(output_mode)
         source = job_dir / "source.mp3"
         transcript_file = job_dir / "transcript.txt"
         translation_file = job_dir / "translation.txt"
-        output = job_dir / f"{slug(title)}-{slug(target_lang, 'translated')}.wav"
+        output_text_file = job_dir / "output.txt"
+        output = job_dir / f"{slug(title)}-{output_mode}.wav"
 
         set_job(job_id, status="downloading", progress=10)
         download_audio(audio_url, source)
@@ -429,6 +510,7 @@ def run_job(
 
         all_transcripts = []
         all_translations = []
+        all_outputs = []
         output_parts = []
         skipped_parts = []
         for index, part_path in enumerate(source_parts):
@@ -438,7 +520,7 @@ def run_job(
                 status=f"part {index + 1}/{len(source_parts)} transcribing",
                 progress=base_progress,
             )
-            transcript = transcribe(part_path)
+            transcript = normalize_transcript_paragraphs(transcribe(part_path))
             all_transcripts.append(f"[Part {index + 1}]\n{transcript}")
             transcript_file.write_text("\n\n".join(all_transcripts), encoding="utf-8")
 
@@ -449,14 +531,18 @@ def run_job(
             )
             try:
                 translated = translate(transcript, target_lang)
+                final_text = build_output_text(transcript, translated, output_mode)
 
                 set_job(
                     job_id,
                     status=f"part {index + 1}/{len(source_parts)} speaking",
                     progress=min(base_progress + 10, 95),
                 )
-                part_output = job_dir / f"translated_part_{index:04d}.wav"
-                synthesize(translated, part_output)
+                part_output = job_dir / f"{output_mode}_part_{index:04d}.wav"
+                if output_mode == "bilingual":
+                    synthesize_with_original_audio(part_path, translated, part_output)
+                else:
+                    synthesize(final_text, part_output)
             except GlmApiError as exc:
                 if exc.code != "1301":
                     raise
@@ -464,6 +550,8 @@ def run_job(
                 notice = "[Skipped: GLM content filter blocked this part.]"
                 all_translations.append(f"[Part {index + 1}]\n{notice}")
                 translation_file.write_text("\n\n".join(all_translations), encoding="utf-8")
+                all_outputs.append(f"[Part {index + 1}]\n{notice}")
+                output_text_file.write_text("\n\n".join(all_outputs), encoding="utf-8")
                 set_job(
                     job_id,
                     skipped_parts=skipped_parts,
@@ -475,12 +563,16 @@ def run_job(
             output_parts.append(part_output)
             all_translations.append(f"[Part {index + 1}]\n{translated}")
             translation_file.write_text("\n\n".join(all_translations), encoding="utf-8")
+            all_outputs.append(f"[Part {index + 1}]\n{final_text}")
+            output_text_file.write_text("\n\n".join(all_outputs), encoding="utf-8")
 
             part_info = {
                 "index": index,
                 "title": f"Part {index + 1}",
                 "url": f"/files/{job_id}/{part_output.name}",
+                "transcript": transcript,
                 "translation": translated,
+                "output_text": final_text,
             }
             with LOCK:
                 current_parts = list(STATE.get(job_id, {}).get("parts", []))
@@ -499,35 +591,12 @@ def run_job(
         set_job(job_id, status="finalizing", progress=97)
         concat_audio(output_parts, output)
 
-        set_job(job_id, status="done", progress=100, output=f"/files/{job_id}/{output.name}")
-    except Exception as exc:
-        set_job(job_id, status="failed", error=friendly_error(exc), progress=0)
-
-
-def run_demo_job(job_id: str, target_lang: str) -> None:
-    job_dir = JOBS / job_id
-    try:
-        transcript_file = job_dir / "transcript.txt"
-        translation_file = job_dir / "translation.txt"
-        output = job_dir / f"demo-{slug(target_lang, 'translated')}.wav"
-
-        set_job(job_id, status="sample transcript", progress=25)
-        transcript_file.write_text(DEMO_TRANSCRIPT, encoding="utf-8")
-
-        set_job(job_id, status="translating", progress=60)
-        translated = translate(DEMO_TRANSCRIPT, target_lang)
-        translation_file.write_text(translated, encoding="utf-8")
-
-        set_job(job_id, status="speaking", progress=85)
-        synthesize(translated, output)
-
         set_job(
             job_id,
             status="done",
             progress=100,
             output=f"/files/{job_id}/{output.name}",
-            transcript=DEMO_TRANSCRIPT,
-            translation=translated,
+            output_text="\n\n".join(all_outputs),
         )
     except Exception as exc:
         set_job(job_id, status="failed", error=friendly_error(exc), progress=0)
@@ -559,6 +628,7 @@ class Handler(BaseHTTPRequestHandler):
                 title = fields.get("title", "episode")
                 audio_url = fields.get("audio_url", "")
                 target_lang = fields.get("target_lang", "Chinese")
+                output_mode = normalize_output_mode(fields.get("output_mode", "chinese"))
                 default_seconds = os.environ.get("LISTEN_PART_SECONDS", "300")
                 listen_part_seconds = normalize_seconds(fields.get("listen_part_seconds", default_seconds))
                 job_id = uuid.uuid4().hex[:12]
@@ -568,6 +638,7 @@ class Handler(BaseHTTPRequestHandler):
                     title=title,
                     audio_url=audio_url,
                     target_lang=target_lang,
+                    output_mode=output_mode,
                     listen_part_seconds=listen_part_seconds,
                     status="queued",
                     progress=0,
@@ -575,25 +646,42 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 thread = threading.Thread(
                     target=run_job,
-                    args=(job_id, title, audio_url, target_lang, listen_part_seconds),
+                    args=(job_id, title, audio_url, target_lang, listen_part_seconds, output_mode),
                     daemon=True,
                 )
                 thread.start()
                 self.html(job_page(job_id))
             elif parsed.path == "/demo":
                 target_lang = fields.get("target_lang", "Chinese")
+                output_mode = normalize_output_mode(fields.get("output_mode", "chinese"))
+                default_seconds = os.environ.get("LISTEN_PART_SECONDS", "300")
+                listen_part_seconds = normalize_seconds(fields.get("listen_part_seconds", default_seconds))
                 job_id = uuid.uuid4().hex[:12]
                 set_job(
                     job_id,
                     id=job_id,
-                    title="Demo sample",
+                    title=SAMPLE_MP3_TITLE,
+                    audio_url=SAMPLE_MP3.as_uri(),
                     target_lang=target_lang,
+                    output_mode=output_mode,
+                    listen_part_seconds=listen_part_seconds,
                     status="queued",
                     progress=0,
                     created_at=int(time.time()),
                     demo=True,
                 )
-                thread = threading.Thread(target=run_demo_job, args=(job_id, target_lang), daemon=True)
+                thread = threading.Thread(
+                    target=run_job,
+                    args=(
+                        job_id,
+                        SAMPLE_MP3_TITLE,
+                        SAMPLE_MP3.as_uri(),
+                        target_lang,
+                        listen_part_seconds,
+                        output_mode,
+                    ),
+                    daemon=True,
+                )
                 thread.start()
                 self.html(job_page(job_id))
             else:
@@ -657,7 +745,7 @@ def page(title: str, body: str) -> str:
 <title>{html.escape(title)}</title>
 <style>
 body{{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:860px;margin:32px auto;padding:0 16px;line-height:1.45;color:#1f2933;background:#fbfbf8}}
-input,button{{font:inherit;padding:10px;border:1px solid #aab3bd;border-radius:6px}}
+input,select,button{{font:inherit;padding:10px;border:1px solid #aab3bd;border-radius:6px}}
 input[type=url],input[type=text]{{width:min(100%,620px);box-sizing:border-box}}
 button{{background:#184e77;color:white;border-color:#184e77;cursor:pointer}}
 .episode{{padding:14px 0;border-top:1px solid #d8dde3}}
@@ -683,10 +771,21 @@ def home() -> str:
 <p class="muted">Sample RSS: {html.escape(SAMPLE_RSS_TITLE)} · {html.escape(SAMPLE_RSS_URL)}</p>
 <form method="post" action="/demo">
   <p><input type="text" name="target_lang" value="Chinese" aria-label="Demo target language"></p>
-  <p><button>Run built-in sample</button></p>
+  <p>{output_mode_select()}</p>
+  <p><input type="text" name="listen_part_seconds" value="300" placeholder="Part seconds, 300 = 5 min" aria-label="Sample part seconds"></p>
+  <p><button>Run sample MP3</button></p>
+  <p class="muted">30-second local English MP3 sample</p>
 </form>
 <p class="muted">Tiny MVP: standard-library Python app, GLM API for ASR/translation/TTS.</p>""",
     )
+
+
+def output_mode_select() -> str:
+    return """<select name="output_mode" aria-label="Output mode">
+  <option value="chinese" selected>Chinese only</option>
+  <option value="english">English only</option>
+  <option value="bilingual">Bilingual paragraphs</option>
+</select>"""
 
 
 def episode_page(feed_url: str, episodes: list[dict]) -> str:
@@ -704,6 +803,7 @@ def episode_page(feed_url: str, episodes: list[dict]) -> str:
   <input type="hidden" name="title" value="{title}">
   <input type="hidden" name="audio_url" value="{audio_url}">
   <p><input type="text" name="target_lang" value="Chinese" aria-label="Target language"></p>
+  <p>{output_mode_select()}</p>
   <p><input type="text" name="listen_part_seconds" value="{default_seconds}" placeholder="Part seconds, 300 = 5 min" aria-label="Part seconds"></p>
   <button>Translate this episode</button>
 </form>
@@ -736,7 +836,7 @@ async function poll(){{
   if(j.output) {{
     let html = '<p><a href="' + j.output + '">Download full WAV</a></p>';
     if(!(j.parts && j.parts.length)) html += '<audio controls src="' + j.output + '"></audio>';
-    if(j.translation) html += '<h2>Translation</h2><pre>' + escapeHtml(j.translation) + '</pre>';
+    if(j.output_text) html += '<h2>Output</h2><pre>' + escapeHtml(j.output_text) + '</pre>';
     document.getElementById('result').innerHTML = html;
   }}
   if(j.error) document.getElementById('result').textContent = j.error;
@@ -757,7 +857,11 @@ function renderParts(parts){{
     audio.src = urls[0];
     audio.play().catch(() => {{}});
   }}
-  const html = parts.map((p, i) => '<li><a href="' + p.url + '">' + escapeHtml(p.title || ('Part ' + (i + 1))) + '</a></li>').join('');
+  const html = parts.map((p, i) => {{
+    let title = escapeHtml(p.title || ('Part ' + (i + 1)));
+    let text = p.output_text ? '<pre>' + escapeHtml(p.output_text) + '</pre>' : '';
+    return '<li><a href="' + p.url + '">' + title + '</a>' + text + '</li>';
+  }}).join('');
   document.getElementById('parts').innerHTML = '<h2>Ready parts</h2><ol>' + html + '</ol>';
 }}
 function escapeHtml(s){{

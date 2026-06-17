@@ -2,3 +2,27 @@ data/
 __pycache__/
 *.pyc
 .env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / local tooling
+.vscode/
+.idea/
+.codex
+
+# R session / project-local state
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+.Rlibs/
+
+# Windows alternate data streams
+*:Zone.Identifier
+
+# Project data and generated outputs
+input/
+output/

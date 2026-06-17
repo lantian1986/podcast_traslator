@@ -37,19 +37,20 @@ Open:
 http://127.0.0.1:8080
 ```
 
-## Built-in sample
+## Sample MP3
 
-Click `Run built-in sample` on the home page.
+Click `Run sample MP3` on the home page.
 
-The sample skips RSS download and ASR. It uses a short built-in English
-transcript, then runs:
+The sample uses the bundled `assets/sample-english-30s.mp3`, then runs the full
+flow:
 
 ```text
-sample transcript -> GLM translation -> GLM TTS -> downloadable WAV
+sample MP3 -> GLM ASR -> GLM translation -> GLM TTS -> downloadable WAV
 ```
 
-This lets you quickly check the flow and hear the output without installing
-`ffmpeg`.
+In bilingual mode, the text output shows English and Chinese paragraphs. The
+audio output plays each original English audio part first, followed by the
+Chinese TTS translation for that part.
 
 ## Long podcast playback
 
