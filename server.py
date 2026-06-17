@@ -680,11 +680,7 @@ def home() -> str:
   <p><input required type="url" name="url" placeholder="Podcast RSS URL"></p>
   <p><button>Load episodes</button></p>
 </form>
-<form method="post" action="/rss">
-  <input type="hidden" name="url" value="{html.escape(SAMPLE_RSS_URL)}">
-  <p><button>Load sample RSS</button></p>
-  <p class="muted">{html.escape(SAMPLE_RSS_TITLE)} · {html.escape(SAMPLE_RSS_URL)}</p>
-</form>
+<p class="muted">Sample RSS: {html.escape(SAMPLE_RSS_TITLE)} · {html.escape(SAMPLE_RSS_URL)}</p>
 <form method="post" action="/demo">
   <p><input type="text" name="target_lang" value="Chinese" aria-label="Demo target language"></p>
   <p><button>Run built-in sample</button></p>
