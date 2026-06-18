@@ -24,5 +24,6 @@ Thumbs.db
 *:Zone.Identifier
 
 # Project data and generated outputs
+docs/
 input/
 output/

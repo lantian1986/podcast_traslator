@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import cgi
+import hashlib
 import html
 import http.client
 import json
@@ -34,6 +35,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 JOBS = DATA / "jobs"
+CACHE = DATA / "cache"
+DOWNLOAD_CACHE = CACHE / "downloads"
+TRANSCRIPT_CACHE = CACHE / "transcripts"
+TRANSLATION_CACHE = CACHE / "translations"
 USER_AGENT = "podcast-translator-mvp/0.1"
 
 STATE: dict[str, dict] = {}
@@ -84,6 +89,9 @@ def friendly_error(exc: Exception) -> str:
 
 def ensure_dirs() -> None:
     JOBS.mkdir(parents=True, exist_ok=True)
+    DOWNLOAD_CACHE.mkdir(parents=True, exist_ok=True)
+    TRANSCRIPT_CACHE.mkdir(parents=True, exist_ok=True)
+    TRANSLATION_CACHE.mkdir(parents=True, exist_ok=True)
 
 
 def load_env(path: Path = ROOT / ".env") -> None:
@@ -103,6 +111,20 @@ def load_env(path: Path = ROOT / ".env") -> None:
 def slug(value: str, fallback: str = "episode") -> str:
     value = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-").lower()
     return value[:80] or fallback
+
+
+def cache_key(*parts: str) -> str:
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def normalize_seconds(value: str, default: int = 300) -> str:
@@ -199,14 +221,23 @@ def text_of(node: ET.Element, tag: str) -> str:
     return (child.text or "").strip() if child is not None else ""
 
 
-def download_audio(url: str, dest: Path) -> None:
+def download_audio(url: str, dest: Path) -> bool:
+    cache_path = DOWNLOAD_CACHE / f"{cache_key(url)}.mp3"
+    if cache_path.exists():
+        shutil.copyfile(cache_path, dest)
+        return True
+
+    tmp = cache_path.with_name(f"{cache_path.name}.{uuid.uuid4().hex}.tmp")
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=120) as resp, dest.open("wb") as fh:
+    with urllib.request.urlopen(req, timeout=120) as resp, tmp.open("wb") as fh:
         while True:
             chunk = resp.read(1024 * 512)
             if not chunk:
                 break
             fh.write(chunk)
+    os.replace(tmp, cache_path)
+    shutil.copyfile(cache_path, dest)
+    return False
 
 
 def glm_request(method: str, path: str, body: bytes, headers: dict[str, str]) -> bytes:
@@ -255,21 +286,30 @@ def multipart(fields: dict[str, str], files: dict[str, Path]) -> tuple[bytes, st
     return b"".join(chunks), boundary
 
 
-def transcribe(audio_path: Path) -> str:
+def transcribe(audio_path: Path) -> tuple[str, int]:
     chunks = split_audio(audio_path)
     parts = []
     prompt = ""
+    cache_hits = 0
     for chunk in chunks:
-        part = transcribe_chunk(chunk, prompt)
+        part, cache_hit = transcribe_chunk(chunk, prompt)
+        if cache_hit:
+            cache_hits += 1
         if part:
             parts.append(part)
             prompt = "\n".join(parts)[-7000:]
-    return "\n".join(parts).strip()
+    return "\n".join(parts).strip(), cache_hits
 
 
-def transcribe_chunk(audio_path: Path, prompt: str = "") -> str:
+def transcribe_chunk(audio_path: Path, prompt: str = "") -> tuple[str, bool]:
+    model = os.environ.get("GLM_ASR_MODEL", "glm-asr-2512")
+    audio_hash = hashlib.sha256(audio_path.read_bytes()).hexdigest()
+    cache_path = TRANSCRIPT_CACHE / f"{cache_key(model, prompt, audio_hash)}.txt"
+    if cache_path.exists():
+        return cache_path.read_text(encoding="utf-8"), True
+
     fields = {
-        "model": os.environ.get("GLM_ASR_MODEL", "glm-asr-2512"),
+        "model": model,
     }
     if prompt:
         fields["prompt"] = prompt
@@ -284,11 +324,17 @@ def transcribe_chunk(audio_path: Path, prompt: str = "") -> str:
         {"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
     data = json.loads(raw)
-    return data.get("text", "").strip()
+    transcript = data.get("text", "").strip()
+    atomic_write_text(cache_path, transcript)
+    return transcript, False
 
 
-def translate(text: str, target_lang: str) -> str:
+def translate(text: str, target_lang: str) -> tuple[str, bool]:
     model = os.environ.get("GLM_TRANSLATE_MODEL", "glm-4.7-flash")
+    cache_path = TRANSLATION_CACHE / f"{cache_key(model, target_lang, text)}.txt"
+    if cache_path.exists():
+        return cache_path.read_text(encoding="utf-8"), True
+
     payload = {
         "model": model,
         "messages": [
@@ -312,7 +358,9 @@ def translate(text: str, target_lang: str) -> str:
         {"Content-Type": "application/json"},
     )
     data = json.loads(raw)
-    return data["choices"][0]["message"]["content"].strip()
+    translated = data["choices"][0]["message"]["content"].strip()
+    atomic_write_text(cache_path, translated)
+    return translated, False
 
 
 def synthesize(text: str, out_path: Path) -> None:
@@ -523,9 +571,13 @@ def run_job(
         translation_file = job_dir / "translation.txt"
         output_text_file = job_dir / "output.txt"
         output = job_dir / f"{slug(title)}-{output_mode}.wav"
+        cache_hits = {"downloads": 0, "transcripts": 0, "translations": 0}
 
         set_job(job_id, status="downloading", progress=10)
-        download_audio(audio_url, source)
+        download_hit = download_audio(audio_url, source)
+        if download_hit:
+            cache_hits["downloads"] += 1
+            set_job(job_id, status="downloaded from cache", progress=12, cache_hits=dict(cache_hits))
 
         set_job(job_id, status="splitting", progress=15, parts=[], part_count=0)
         source_parts = split_listen_parts(source, listen_part_seconds)
@@ -543,7 +595,16 @@ def run_job(
                 status=f"part {index + 1}/{len(source_parts)} transcribing",
                 progress=base_progress,
             )
-            transcript = normalize_transcript_paragraphs(transcribe(part_path))
+            transcript, transcript_hits = transcribe(part_path)
+            if transcript_hits:
+                cache_hits["transcripts"] += transcript_hits
+                set_job(
+                    job_id,
+                    status=f"part {index + 1}/{len(source_parts)} transcribed from cache",
+                    progress=min(base_progress + 3, 95),
+                    cache_hits=dict(cache_hits),
+                )
+            transcript = normalize_transcript_paragraphs(transcript)
             all_transcripts.append(f"[Part {index + 1}]\n{transcript}")
             transcript_file.write_text("\n\n".join(all_transcripts), encoding="utf-8")
 
@@ -553,7 +614,15 @@ def run_job(
                 progress=min(base_progress + 5, 95),
             )
             try:
-                translated = translate(transcript, target_lang)
+                translated, translation_hit = translate(transcript, target_lang)
+                if translation_hit:
+                    cache_hits["translations"] += 1
+                    set_job(
+                        job_id,
+                        status=f"part {index + 1}/{len(source_parts)} translated from cache",
+                        progress=min(base_progress + 7, 95),
+                        cache_hits=dict(cache_hits),
+                    )
                 final_text = build_output_text(transcript, translated, output_mode)
 
                 set_job(
@@ -875,6 +944,7 @@ async function poll(){{
 	  const j = await r.json();
 	  let count = j.part_count ? ' · ' + (j.ready_parts || 0) + '/' + j.part_count + ' parts ready' : '';
 	  if(j.skipped_parts && j.skipped_parts.length) count += ' · skipped ' + j.skipped_parts.join(', ');
+	  if(j.cache_hits) count += ' · cache downloads ' + (j.cache_hits.downloads || 0) + ', transcripts ' + (j.cache_hits.transcripts || 0) + ', translations ' + (j.cache_hits.translations || 0);
 	  document.getElementById('status').textContent = (j.status || '') + ' ' + (j.progress || 0) + '%' + count;
   document.getElementById('fill').style.width = (j.progress || 0) + '%';
   if(j.parts && j.parts.length) renderParts(j.parts);
